@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncio
 import json
 import json_repair
+import os
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
 
@@ -18,7 +19,6 @@ from lightrag.utils import (
     Tokenizer,
     is_float_regex,
     sanitize_and_normalize_extracted_text,
-    pack_user_ass_to_openai_messages,
     split_string_by_multi_markers,
     truncate_list_by_token_size,
     compute_args_hash,
@@ -28,6 +28,7 @@ from lightrag.utils import (
     use_llm_func_with_cache,
     update_chunk_cache_list,
     remove_think_tags,
+    pack_user_ass_to_openai_messages,
     pick_by_weighted_polling,
     pick_by_vector_similarity,
     process_chunks_unified,
@@ -52,6 +53,10 @@ from lightrag.base import (
     QueryContextResult,
 )
 from lightrag.prompt import PROMPTS
+from lightrag.frame_extractor import (
+    extract_keywords_from_frames,
+    extract_entities_from_frames,
+)
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -75,6 +80,14 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+
+# Chế độ trích xuất ngữ nghĩa.  Đặt qua biến môi trường LIGHTRAG_FRAME_EXTRACTION_MODE:
+#   "none"    — Baseline: LLM cho tất cả (giống phiên bản gốc LightRAG)
+#   "hl_only" — Case 1: Frame-semantic chỉ cho high-level keywords; LLM cho thực thể và ll-keywords
+#   "full"    — Case 2: Frame-semantic cho cả hai (mặc định)
+FRAME_EXTRACTION_MODE: str = os.getenv(
+    "LIGHTRAG_FRAME_EXTRACTION_MODE", "full"
+).lower().strip()
 
 
 def _truncate_entity_identifier(
@@ -2896,27 +2909,20 @@ async def extract_entities(
                     "User cancelled during entity extraction"
                 )
 
+    # ── LLM extraction setup (used by FRAME_EXTRACTION_MODE "none" and "hl_only") ──
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
 
-    ordered_chunks = list(chunks.items())
-    # add language and example number params to prompt
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    entity_types = global_config["addon_params"].get(
-        "entity_types", DEFAULT_ENTITY_TYPES
-    )
-
+    entity_types = global_config["addon_params"].get("entity_types", DEFAULT_ENTITY_TYPES)
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
-
     example_context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=", ".join(entity_types),
         language=language,
     )
-    # add example's format
     examples = examples.format(**example_context_base)
-
     context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
@@ -2925,168 +2931,152 @@ async def extract_entities(
         language=language,
     )
 
+    ordered_chunks = list(chunks.items())
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
 
     async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
-        """Process a single chunk
+        """Process a single chunk — dispatches to frame-semantic or LLM extraction
+        based on FRAME_EXTRACTION_MODE.
+
         Args:
-            chunk_key_dp (tuple[str, TextChunkSchema]):
-                ("chunk-xxxxxx", {"tokens": int, "content": str, "full_doc_id": str, "chunk_order_index": int})
+            chunk_key_dp: ("chunk-xxxxxx", {tokens, content, full_doc_id, ...})
         Returns:
-            tuple: (maybe_nodes, maybe_edges) containing extracted entities and relationships
+            (maybe_nodes, maybe_edges) — extracted entities and relations
         """
         nonlocal processed_chunks
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
-        # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
 
-        # Create cache keys collector for batch processing
-        cache_keys_collector = []
-
-        # Get initial extraction
-        # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_system_prompt"
-        ].format(**context_base)
-        # Format user prompts with input_text for each chunk
-        entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
-            **{**context_base, "input_text": content}
-        )
-        entity_continue_extraction_user_prompt = PROMPTS[
-            "entity_continue_extraction_user_prompt"
-        ].format(**{**context_base, "input_text": content})
-
-        final_result, timestamp = await use_llm_func_with_cache(
-            entity_extraction_user_prompt,
-            use_llm_func,
-            system_prompt=entity_extraction_system_prompt,
-            llm_response_cache=llm_response_cache,
-            cache_type="extract",
-            chunk_id=chunk_key,
-            cache_keys_collector=cache_keys_collector,
-        )
-
-        history = pack_user_ass_to_openai_messages(
-            entity_extraction_user_prompt, final_result
-        )
-
-        # Process initial extraction with file path
-        maybe_nodes, maybe_edges = await _process_extraction_result(
-            final_result,
-            chunk_key,
-            timestamp,
-            file_path,
-            tuple_delimiter=context_base["tuple_delimiter"],
-            completion_delimiter=context_base["completion_delimiter"],
-        )
-
-        # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
-        if entity_extract_max_gleaning > 0:
-            # Calculate total tokens for the gleaning request to prevent context window overflow
-            tokenizer = global_config["tokenizer"]
-            max_input_tokens = global_config["max_extract_input_tokens"]
-
-            # Approximate total tokens: system prompt + history + user prompt.
-            # This slightly underestimates actual API usage (missing role/framing tokens)
-            # but is sufficient as a safety guard against context window overflow.
-            history_str = json.dumps(history, ensure_ascii=False)
-            full_context_str = (
-                entity_extraction_system_prompt
-                + history_str
-                + entity_continue_extraction_user_prompt
+        # ── Case 2 / "full": frame-semantic → LLM filter ────────────────────
+        if FRAME_EXTRACTION_MODE == "full":
+            maybe_nodes, maybe_edges = await extract_entities_from_frames(
+                content, chunk_key, file_path
             )
-            token_count = len(tokenizer.encode(full_context_str))
+            # LLM post-filter: remove time expressions, common nouns, fragments
+            maybe_nodes, maybe_edges = await _llm_filter_frame_entities(
+                maybe_nodes, maybe_edges, global_config, llm_response_cache
+            )
 
-            if token_count > max_input_tokens:
-                logger.warning(
-                    f"Gleaning stopped for chunk {chunk_key}: Input tokens ({token_count}) exceeded limit ({max_input_tokens})."
-                )
-            else:
-                glean_result, timestamp = await use_llm_func_with_cache(
-                    entity_continue_extraction_user_prompt,
-                    use_llm_func,
-                    system_prompt=entity_extraction_system_prompt,
-                    llm_response_cache=llm_response_cache,
-                    history_messages=history,
-                    cache_type="extract",
-                    chunk_id=chunk_key,
-                    cache_keys_collector=cache_keys_collector,
-                )
+        # ── Baseline "none" / Case 1 "hl_only": LLM-based entity extraction ──
+        else:
+            cache_keys_collector = []
 
-                # Process gleaning result separately with file path
-                glean_nodes, glean_edges = await _process_extraction_result(
-                    glean_result,
-                    chunk_key,
-                    timestamp,
-                    file_path,
-                    tuple_delimiter=context_base["tuple_delimiter"],
-                    completion_delimiter=context_base["completion_delimiter"],
-                )
+            entity_extraction_system_prompt = PROMPTS[
+                "entity_extraction_system_prompt"
+            ].format(**context_base)
+            entity_extraction_user_prompt = PROMPTS[
+                "entity_extraction_user_prompt"
+            ].format(**{**context_base, "input_text": content})
+            entity_continue_extraction_user_prompt = PROMPTS[
+                "entity_continue_extraction_user_prompt"
+            ].format(**{**context_base, "input_text": content})
 
-                # Merge results - compare description lengths to choose better version
-                for i, (entity_name, glean_entities) in enumerate(
-                    glean_nodes.items(), start=1
-                ):
-                    if entity_name in maybe_nodes:
-                        # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_nodes[entity_name][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_entities[0].get("description", "") or ""
-                        )
+            final_result, timestamp = await use_llm_func_with_cache(
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+            )
 
-                        if glean_desc_len > original_desc_len:
-                            maybe_nodes[entity_name] = list(glean_entities)
-                        # Otherwise keep original version
-                    else:
-                        # New entity from gleaning stage
-                        maybe_nodes[entity_name] = list(glean_entities)
-                    await _cooperative_yield(i, every=8)
+            history = pack_user_ass_to_openai_messages(
+                entity_extraction_user_prompt, final_result
+            )
 
-                for i, (edge_key, glean_edge_list) in enumerate(
-                    glean_edges.items(), start=1
-                ):
-                    if edge_key in maybe_edges:
-                        # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_edges[edge_key][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_edge_list[0].get("description", "") or ""
-                        )
-
-                        if glean_desc_len > original_desc_len:
-                            maybe_edges[edge_key] = list(glean_edge_list)
-                        # Otherwise keep original version
-                    else:
-                        # New edge from gleaning stage
-                        maybe_edges[edge_key] = list(glean_edge_list)
-                    await _cooperative_yield(i, every=8)
-
-        # Batch update chunk's llm_cache_list with all collected cache keys
-        if cache_keys_collector and text_chunks_storage:
-            await update_chunk_cache_list(
+            maybe_nodes, maybe_edges = await _process_extraction_result(
+                final_result,
                 chunk_key,
-                text_chunks_storage,
-                cache_keys_collector,
-                "entity_extraction",
+                timestamp,
+                file_path,
+                tuple_delimiter=context_base["tuple_delimiter"],
+                completion_delimiter=context_base["completion_delimiter"],
             )
+
+            if entity_extract_max_gleaning > 0:
+                tokenizer = global_config["tokenizer"]
+                max_input_tokens = global_config["max_extract_input_tokens"]
+                history_str = json.dumps(history, ensure_ascii=False)
+                full_context_str = (
+                    entity_extraction_system_prompt
+                    + history_str
+                    + entity_continue_extraction_user_prompt
+                )
+                token_count = len(tokenizer.encode(full_context_str))
+
+                if token_count > max_input_tokens:
+                    logger.warning(
+                        f"Gleaning stopped for chunk {chunk_key}: "
+                        f"Input tokens ({token_count}) exceeded limit ({max_input_tokens})."
+                    )
+                else:
+                    glean_result, timestamp = await use_llm_func_with_cache(
+                        entity_continue_extraction_user_prompt,
+                        use_llm_func,
+                        system_prompt=entity_extraction_system_prompt,
+                        llm_response_cache=llm_response_cache,
+                        history_messages=history,
+                        cache_type="extract",
+                        chunk_id=chunk_key,
+                        cache_keys_collector=cache_keys_collector,
+                    )
+
+                    glean_nodes, glean_edges = await _process_extraction_result(
+                        glean_result,
+                        chunk_key,
+                        timestamp,
+                        file_path,
+                        tuple_delimiter=context_base["tuple_delimiter"],
+                        completion_delimiter=context_base["completion_delimiter"],
+                    )
+
+                    for i, (entity_name, glean_entities) in enumerate(
+                        glean_nodes.items(), start=1
+                    ):
+                        if entity_name in maybe_nodes:
+                            orig_len = len(maybe_nodes[entity_name][0].get("description", "") or "")
+                            glean_len = len(glean_entities[0].get("description", "") or "")
+                            if glean_len > orig_len:
+                                maybe_nodes[entity_name] = list(glean_entities)
+                        else:
+                            maybe_nodes[entity_name] = list(glean_entities)
+                        await _cooperative_yield(i, every=8)
+
+                    for i, (edge_key, glean_edge_list) in enumerate(
+                        glean_edges.items(), start=1
+                    ):
+                        if edge_key in maybe_edges:
+                            orig_len = len(maybe_edges[edge_key][0].get("description", "") or "")
+                            glean_len = len(glean_edge_list[0].get("description", "") or "")
+                            if glean_len > orig_len:
+                                maybe_edges[edge_key] = list(glean_edge_list)
+                        else:
+                            maybe_edges[edge_key] = list(glean_edge_list)
+                        await _cooperative_yield(i, every=8)
+
+            if cache_keys_collector and text_chunks_storage:
+                await update_chunk_cache_list(
+                    chunk_key,
+                    text_chunks_storage,
+                    cache_keys_collector,
+                    "entity_extraction",
+                )
 
         processed_chunks += 1
-        entities_count = len(maybe_nodes)
-        relations_count = len(maybe_edges)
-        log_message = f"Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}"
+        log_message = (
+            f"[{FRAME_EXTRACTION_MODE}] Chunk {processed_chunks}/{total_chunks} "
+            f"→ {len(maybe_nodes)} Ent + {len(maybe_edges)} Rel  {chunk_key}"
+        )
         logger.info(log_message)
         if pipeline_status is not None:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
-        # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
 
     # Get max async tasks limit from global_config
@@ -3403,45 +3393,161 @@ async def get_keywords_from_query(
     return hl_keywords, ll_keywords
 
 
-async def extract_keywords_only(
+async def _llm_filter_frame_entities(
+    maybe_nodes: dict,
+    maybe_edges: dict,
+    global_config: dict,
+    llm_response_cache: BaseKVStorage | None = None,
+) -> tuple[dict, dict]:
+    """Post-process frame-extracted entities with LLM: filter noise + normalize names.
+
+    The LLM receives all extracted entity names, then:
+      1. Discards noise (time expressions, pronouns, generic nouns, fragments).
+      2. Returns a normalized name for each kept entity (removes articles,
+         fixes casing, merges near-duplicates).
+
+    Entity nodes and edges are updated to use normalized names.
+    Falls back to original extraction if LLM fails.
+    """
+    if not maybe_nodes:
+        return maybe_nodes, maybe_edges
+
+    use_llm_func: callable = global_config["llm_model_func"]
+    use_llm_func = partial(use_llm_func, _priority=6)
+
+    # Build input: {name: role_type}
+    entities_json = json.dumps(
+        {name: entries[0].get("entity_type", "") for name, entries in maybe_nodes.items()},
+        ensure_ascii=False,
+    )
+
+    prompt = PROMPTS["frame_entity_filter"].format(entities_json=entities_json)
+
+    try:
+        result = await use_llm_func(prompt, keyword_extraction=True)
+        result = remove_think_tags(result)
+        data = json_repair.loads(result)
+        # New format: {"entities": [{"original": "...", "normalized": "..."}, ...]}
+        entity_list = data.get("entities", [])
+    except Exception as exc:
+        logger.warning("[frame_filter] Entity filter LLM failed (%s) — keeping originals", exc)
+        return maybe_nodes, maybe_edges
+
+    if not entity_list:
+        logger.debug("[frame_filter] LLM kept 0 entities — keeping originals to avoid empty graph")
+        return maybe_nodes, maybe_edges
+
+    # Build rename map: original → normalized
+    rename_map: dict[str, str] = {}
+    for entry in entity_list:
+        if not isinstance(entry, dict):
+            continue
+        original = entry.get("original", "").strip()
+        normalized = entry.get("normalized", original).strip() or original
+        if original:
+            rename_map[original] = normalized
+
+    kept_originals = set(rename_map.keys())
+    removed = set(maybe_nodes.keys()) - kept_originals
+    if removed:
+        logger.debug("[frame_filter] Discarded %d noisy entities: %s", len(removed), list(removed)[:10])
+
+    # Rebuild nodes with normalized names
+    clean_nodes: dict = {}
+    for orig_name, entries in maybe_nodes.items():
+        if orig_name not in rename_map:
+            continue
+        norm_name = rename_map[orig_name]
+        updated_entries = []
+        for e in entries:
+            updated_e = {**e, "entity_name": norm_name}
+            updated_entries.append(updated_e)
+        # Merge into existing normalized key if a duplicate resolves to same norm_name
+        if norm_name in clean_nodes:
+            clean_nodes[norm_name].extend(updated_entries)
+        else:
+            clean_nodes[norm_name] = updated_entries
+
+    # Rebuild edges with normalized names; drop edges involving discarded entities
+    clean_edges: dict = {}
+    for (src, tgt), edge_list in maybe_edges.items():
+        norm_src = rename_map.get(src)
+        norm_tgt = rename_map.get(tgt)
+        if not norm_src or not norm_tgt or norm_src == norm_tgt:
+            continue
+        updated_edges = [
+            {**e, "src_id": norm_src, "tgt_id": norm_tgt}
+            for e in edge_list
+        ]
+        edge_key = (norm_src, norm_tgt)
+        if edge_key in clean_edges:
+            clean_edges[edge_key].extend(updated_edges)
+        else:
+            clean_edges[edge_key] = updated_edges
+
+    logger.info(
+        "[frame_filter] entities: %d → %d (normalized) | edges: %d → %d",
+        len(maybe_nodes), len(clean_nodes),
+        len(maybe_edges), len(clean_edges),
+    )
+    return clean_nodes, clean_edges
+
+
+async def _llm_filter_frame_keywords(
+    hl_keywords: list[str],
+    ll_keywords: list[str],
+    global_config: dict,
+    param: QueryParam,
+) -> tuple[list[str], list[str]]:
+    """Post-process frame-extracted keywords with LLM to remove noise.
+
+    Sends hl/ll keyword lists to the LLM for cleaning.
+    Falls back to original lists if LLM fails.
+    """
+    if not hl_keywords and not ll_keywords:
+        return hl_keywords, ll_keywords
+
+    if param.model_func:
+        use_model_func = param.model_func
+    else:
+        use_model_func = global_config["llm_model_func"]
+        use_model_func = partial(use_model_func, _priority=5)
+
+    prompt = PROMPTS["frame_keyword_filter"].format(
+        hl_keywords=json.dumps(hl_keywords, ensure_ascii=False),
+        ll_keywords=json.dumps(ll_keywords, ensure_ascii=False),
+    )
+
+    try:
+        result = await use_model_func(prompt, keyword_extraction=True)
+        result = remove_think_tags(result)
+        data = json_repair.loads(result)
+        clean_hl = data.get("high_level_keywords", hl_keywords)
+        clean_ll = data.get("low_level_keywords", ll_keywords)
+    except Exception as exc:
+        logger.warning("[frame_filter] Keyword filter LLM failed (%s) — keeping originals", exc)
+        return hl_keywords, ll_keywords
+
+    logger.debug(
+        "[frame_filter] keywords hl: %d→%d  ll: %d→%d",
+        len(hl_keywords), len(clean_hl),
+        len(ll_keywords), len(clean_ll),
+    )
+    return clean_hl, clean_ll
+
+
+async def _extract_keywords_with_llm(
     text: str,
     param: QueryParam,
     global_config: dict[str, str],
-    hashing_kv: BaseKVStorage | None = None,
+    language: str,
 ) -> tuple[list[str], list[str]]:
-    """
-    Extract high-level and low-level keywords from the given 'text' using the LLM.
-    This method does NOT build the final RAG context or provide a final answer.
-    It ONLY extracts keywords (hl_keywords, ll_keywords).
-    """
+    """LLM-based keyword extraction (original LightRAG behavior).
 
-    # 1. Build the examples
+    Returns (hl_keywords, ll_keywords) extracted by prompting the LLM.
+    Does NOT read/write cache — caller handles caching.
+    """
     examples = "\n".join(PROMPTS["keywords_extraction_examples"])
-
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-
-    # 2. Handle cache if needed - add cache type for keywords
-    args_hash = compute_args_hash(
-        param.mode,
-        text,
-        language,
-    )
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, text, param.mode, cache_type="keywords"
-    )
-    if cached_result is not None:
-        cached_response, _ = cached_result  # Extract content, ignore timestamp
-        try:
-            keywords_data = json_repair.loads(cached_response)
-            return keywords_data.get("high_level_keywords", []), keywords_data.get(
-                "low_level_keywords", []
-            )
-        except (json.JSONDecodeError, KeyError):
-            logger.warning(
-                "Invalid cache format for keywords, proceeding with extraction"
-            )
-
-    # 3. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
         query=text,
         examples=examples,
@@ -3449,44 +3555,104 @@ async def extract_keywords_only(
     )
 
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(kw_prompt))
     logger.debug(
-        f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
+        "[extract_keywords_llm] %d tokens → LLM",
+        len(tokenizer.encode(kw_prompt)),
     )
 
-    # 4. Call the LLM for keyword extraction
     if param.model_func:
         use_model_func = param.model_func
     else:
         use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
     result = await use_model_func(kw_prompt, keyword_extraction=True)
-
-    # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
+
     try:
         keywords_data = json_repair.loads(result)
         if not keywords_data:
-            logger.error("No JSON-like structure found in the LLM respond.")
+            logger.error("[extract_keywords_llm] Empty JSON from LLM.")
             return [], []
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        logger.error(f"LLM respond: {result}")
+    except Exception as exc:
+        logger.error("[extract_keywords_llm] JSON parse error: %s", exc)
         return [], []
 
-    hl_keywords = keywords_data.get("high_level_keywords", [])
-    ll_keywords = keywords_data.get("low_level_keywords", [])
+    return (
+        keywords_data.get("high_level_keywords", []),
+        keywords_data.get("low_level_keywords", []),
+    )
 
-    # 6. Cache only the processed keywords with cache type
+
+async def extract_keywords_only(
+    text: str,
+    param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Extract high-level and low-level keywords from *text*.
+
+    Dispatches based on FRAME_EXTRACTION_MODE:
+      "none"    — LLM for both hl and ll  (baseline, original LightRAG)
+      "hl_only" — Frame-semantic for hl;  LLM for ll
+      "full"    — Frame-semantic for both (default)
+
+    Deduplication / summarisation phases always use LLM regardless of mode.
+    """
+    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+
+    # Cache key is stable across modes so cached results can be reused
+    args_hash = compute_args_hash(param.mode, text, language)
+    cached_result = await handle_cache(
+        hashing_kv, args_hash, text, param.mode, cache_type="keywords"
+    )
+    if cached_result is not None:
+        cached_response, _ = cached_result
+        try:
+            keywords_data = json_repair.loads(cached_response)
+            return (
+                keywords_data.get("high_level_keywords", []),
+                keywords_data.get("low_level_keywords", []),
+            )
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Invalid keyword cache — re-extracting.")
+
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+    if FRAME_EXTRACTION_MODE == "none":
+        # Baseline: LLM for everything
+        hl_keywords, ll_keywords = await _extract_keywords_with_llm(
+            text, param, global_config, language
+        )
+
+    elif FRAME_EXTRACTION_MODE == "hl_only":
+        # Case 1: frame-semantic → hl;  LLM → ll
+        hl_keywords, _ = await extract_keywords_from_frames(text)
+        _, ll_keywords = await _extract_keywords_with_llm(
+            text, param, global_config, language
+        )
+
+    else:
+        # Case 2 / "full" (default): frame-semantic → LLM filter
+        hl_keywords, ll_keywords = await extract_keywords_from_frames(text)
+        hl_keywords, ll_keywords = await _llm_filter_frame_keywords(
+            hl_keywords, ll_keywords, global_config, param
+        )
+
+    logger.debug(
+        "[extract_keywords_only] mode=%s hl=%s ll=%s",
+        FRAME_EXTRACTION_MODE,
+        hl_keywords,
+        ll_keywords,
+    )
+
+    # Cache the result
     if hl_keywords or ll_keywords:
         cache_data = {
             "high_level_keywords": hl_keywords,
             "low_level_keywords": ll_keywords,
         }
-        if hashing_kv.global_config.get("enable_llm_cache"):
-            # Save to cache with query parameters
+        if hashing_kv is not None and hashing_kv.global_config.get("enable_llm_cache"):
             queryparam_dict = {
                 "mode": param.mode,
                 "response_type": param.response_type,

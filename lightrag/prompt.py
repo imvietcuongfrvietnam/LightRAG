@@ -430,3 +430,131 @@ Output:
 
 """,
 ]
+
+# ── Frame-semantic post-processing prompts ──────────────────────────────────
+
+PROMPTS["frame_entity_filter"] = """---Role---
+You are a Knowledge Graph quality reviewer. Your job is to clean and normalize entity lists extracted by an automatic semantic frame parser, before they are stored in a knowledge graph index.
+
+---Goal---
+The frame parser sometimes produces noisy or unnormalized extractions. Review each candidate entity and:
+  1. Decide whether to KEEP or DISCARD it.
+  2. If keeping, provide a NORMALIZED name that is clean and consistent.
+
+---Rules for DISCARD (discard if ANY rule applies)---
+1. **Time / date / duration expressions**: years ("2023"), dates ("January 5th"), durations ("three hours", "a week"), relative time ("yesterday", "last year", "soon").
+2. **Pure numeric or monetary values**: prices ("five thousand dollars", "$500"), percentages ("10%"), standalone quantities ("10 kg", "three") — unless the number is an integral part of a proper name (e.g., "Highway 61").
+3. **Generic common nouns** with no specific referent: single vague words like "thing", "way", "time", "place", "person", "event", "people", "group", "part", "result", "others", "fact", "issue", "case", "area", "level", "type", "kind".
+4. **Fragments / function words**: strings shorter than 3 characters, standalone articles ("the", "a", "an"), conjunctions, relative pronouns ("which", "that", "who", "where", "when").
+5. **Pronouns and vague references**: "he", "she", "it", "they", "we", "I", "this", "that", "those", "these".
+6. **Verb phrases or clauses** that are not noun entities: "running fast", "to increase profits".
+
+---Rules for NORMALIZATION (apply to all kept entities)---
+1. **Remove leading articles**: "the car" → "car", "a company" → "company", UNLESS the article is part of a proper name ("The Beatles", "The New York Times").
+2. **Title Case for proper nouns**: person names, org names, place names, product names.
+3. **Lowercase for common noun phrases**: "annual event", "trade agreement".
+4. **Remove trailing punctuation** and extra whitespace.
+5. **Merge near-duplicates**: if two candidates clearly refer to the same entity (e.g., "Tim Cook" and "Apple CEO Tim Cook"), output only the more canonical form (prefer the shorter, cleaner name unless context requires the longer one).
+
+---Examples---
+
+Example 1:
+Input: {{"Apple CEO Tim Cook": "communicator", "the new iPhone 16": "information", "the company's annual event": "place", "yesterday": "time", "five thousand dollars": "money", "he": "speaker"}}
+Output:
+{{"entities": [
+  {{"original": "Apple CEO Tim Cook", "normalized": "Tim Cook"}},
+  {{"original": "the new iPhone 16", "normalized": "iPhone 16"}},
+  {{"original": "the company's annual event", "normalized": "Apple annual event"}}
+]}}
+
+Example 2:
+Input: {{"The woman": "seller", "the car": "goods", "the man": "buyer", "five thousand dollars": "money", "that": "referent"}}
+Output:
+{{"entities": [
+  {{"original": "The woman", "normalized": "woman"}},
+  {{"original": "the car", "normalized": "car"}},
+  {{"original": "the man", "normalized": "man"}}
+]}}
+
+Example 3:
+Input: {{"Scientists": "cognizer", "climate change": "topic", "global agriculture": "content", "2050": "time", "thing": "phenomenon"}}
+Output:
+{{"entities": [
+  {{"original": "Scientists", "normalized": "scientists"}},
+  {{"original": "climate change", "normalized": "climate change"}},
+  {{"original": "global agriculture", "normalized": "global agriculture"}}
+]}}
+
+---Instructions---
+- Output MUST be a valid JSON object and NOTHING ELSE. No markdown fences (```), no explanatory text before or after.
+- Each kept entity appears as {{"original": "...", "normalized": "..."}}.
+- Discarded entities are simply omitted.
+- If all entities should be discarded, return {{"entities": []}}.
+
+---Real Input---
+Candidate entities (name → frame role):
+{entities_json}
+
+---Output---"""
+
+
+PROMPTS["frame_keyword_filter"] = """---Role---
+You are a RAG retrieval keyword quality reviewer. Your task is to filter and normalize keyword lists extracted by an automatic semantic frame parser from a user query, so only retrieval-useful keywords remain.
+
+---Goal---
+The frame parser extracts:
+  - **high_level_keywords**: FrameNet frame names (e.g., "Commerce_sell", "Statement") — conceptual category labels
+  - **low_level_keywords**: Frame element texts (e.g., "Apple", "Tim Cook") — specific entities/participants
+
+Review both lists, remove noise, and normalize low-level keywords.
+
+---Rules for high_level_keywords (frame names)---
+1. **KEEP** all valid FrameNet frame names (underscore_separated PascalCase). They are conceptual labels useful for retrieval.
+2. **DISCARD** only if clearly invalid, empty, or a single common word that is not a frame name.
+3. Do NOT normalize frame names — preserve original FrameNet casing (e.g., "Commerce_sell", not "commerce sell").
+
+---Rules for low_level_keywords (frame element texts)---
+**DISCARD** if any rule applies:
+1. **Time / date / duration**: "yesterday", "last year", "2023", "three days ago", "soon".
+2. **Pure numeric or monetary values**: "five hundred dollars", "10%", standalone numbers.
+3. **Generic vague words**: "thing", "way", "place", "people", "others", "part", "fact", "issue".
+4. **Pronouns / determiners**: "he", "she", "they", "this", "that", "which", "those".
+5. **Fragments < 3 chars** or standalone articles/conjunctions.
+
+**NORMALIZE** kept low-level keywords:
+1. Remove leading articles: "the car" → "car", "a company" → "company" (unless part of proper name).
+2. Title Case for proper nouns, lowercase for common phrases.
+3. Remove trailing punctuation.
+
+---Examples---
+
+Example 1:
+Input:
+high_level_keywords: ["Commerce_sell", "Quantified_mass"]
+low_level_keywords: ["The woman", "the car", "the man", "five thousand dollars", "that"]
+Output:
+{{"high_level_keywords": ["Commerce_sell", "Quantified_mass"], "low_level_keywords": ["woman", "car", "man"]}}
+
+Example 2:
+Input:
+high_level_keywords: ["Statement", "Announcing"]
+low_level_keywords: ["Apple CEO Tim Cook", "the new iPhone 16", "the annual event", "yesterday", "he"]
+Output:
+{{"high_level_keywords": ["Statement", "Announcing"], "low_level_keywords": ["Tim Cook", "iPhone 16", "annual event"]}}
+
+Example 3:
+Input:
+high_level_keywords: ["Causation", "Change_of_state"]
+low_level_keywords: ["The heavy rain", "severe flooding", "the coastal villages", "2023", "thing"]
+Output:
+{{"high_level_keywords": ["Causation", "Change_of_state"], "low_level_keywords": ["heavy rain", "severe flooding", "coastal villages"]}}
+
+---Instructions---
+- Output MUST be a valid JSON object and NOTHING ELSE. No markdown fences, no extra text.
+- Return both lists even if one is empty.
+
+---Real Input---
+high_level_keywords (frame names): {hl_keywords}
+low_level_keywords (frame element texts): {ll_keywords}
+
+---Output---"""
